@@ -70,8 +70,16 @@ record propagates. Until then, verify the app over SSM (`curl localhost:5006/api
 
 ## CI/CD (GitHub Actions) — dormant until secret is set
 
-`.github/workflows/ci-cd.yml` deploys on push to `main` via SSM RunCommand
-(OIDC, no static keys). It no-ops safely until enabled.
+`.github/workflows/ci-cd.yml` is a multi-stage pipeline:
+
+1. **`app-ci`** (every push + PR) — install deps, `py_compile` syntax check,
+   `ruff` lint (real-error rules), and an API smoke test (imports the app and
+   asserts `/api/health` → 200 and the JSON 404 handler works).
+2. **`terraform-ci`** (every push + PR) — `terraform fmt -check`, `init -backend=false`, `validate`.
+3. **`deploy`** — runs only on `main`, only after both CI jobs pass, and only
+   when `AWS_DEPLOY_ROLE_ARN` is set; deploys via SSM RunCommand (OIDC, no static keys).
+
+It no-ops safely until the secret is added.
 
 To enable:
 1. Push this repo (incl. `terraform/`, `deploy/`, `.github/`) to GitHub.

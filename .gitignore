@@ -1,0 +1,14 @@
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/tfplan
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+crash.log
+
+# App runtime
+rates.json
+__pycache__/
+*.pyc
+venv/

@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# ─── Todozee Price Fetcher bootstrap (AL2023) ────────────────────────────────
+set -euxo pipefail
+
+APP_DIR=/opt/todozee-price
+APP_USER=todozee
+LOG_DIR=/var/log/todozee-price
+BOOT_LOG=$LOG_DIR/bootstrap.log
+
+mkdir -p "$LOG_DIR"
+# Tee all bootstrap output to a file the CloudWatch agent will ship.
+exec > >(tee -a "$BOOT_LOG") 2>&1
+echo "=== bootstrap start $(date -u) ==="
+
+# Wait for instance IAM creds / network before anything that needs AWS or git.
+for i in $(seq 1 30); do
+  if curl -fsS http://169.254.169.254/latest/meta-data/instance-id >/dev/null 2>&1; then break; fi
+  sleep 2
+done
+
+dnf -y update
+dnf -y install python3 python3-pip git tar amazon-cloudwatch-agent
+
+# ─── App user + code ─────────────────────────────────────────────────────────
+id "$APP_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin "$APP_USER"
+
+if [ ! -d "$APP_DIR/.git" ]; then
+  git clone "${repo_url}" "$APP_DIR"
+fi
+chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+chown -R "$APP_USER":"$APP_USER" "$LOG_DIR"
+# System-wide so git works for any user (todozee/root) regardless of $HOME.
+git config --system --add safe.directory "$APP_DIR" || true
+
+# Python venv + deps.
+sudo -u "$APP_USER" python3 -m venv "$APP_DIR/venv"
+sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install -q --upgrade pip
+sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+
+# Deploy helper used by CI/CD. Embedded here so the instance is self-sufficient
+# even before the terraform/deploy/ helper files are pushed to the repo. Kept in
+# sync with deploy/deploy-app.sh in the repo.
+cat > /usr/local/bin/deploy-app.sh <<'DEPLOY'
+#!/usr/bin/env bash
+set -euo pipefail
+APP_DIR=/opt/todozee-price
+APP_USER=todozee
+APP_PORT=5006
+SHA="$${1:-}"
+echo "[deploy] target sha='$${SHA:-<latest main>}'"
+cd "$APP_DIR"
+git config --system --add safe.directory "$APP_DIR" || true
+sudo -u "$APP_USER" git fetch --all --prune
+if [ -n "$SHA" ]; then
+  sudo -u "$APP_USER" git checkout -f "$SHA"
+else
+  sudo -u "$APP_USER" git checkout -f main
+  sudo -u "$APP_USER" git pull --ff-only origin main
+fi
+sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install -q --upgrade pip
+sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+systemctl restart todozee-price
+echo "[deploy] waiting for health on :$APP_PORT ..."
+for i in $(seq 1 20); do
+  sleep 3
+  if curl -fsS "http://127.0.0.1:$${APP_PORT}/api/health" >/dev/null 2>&1; then
+    echo "[deploy] OK - /api/health responding"
+    exit 0
+  fi
+done
+echo "[deploy] FAILED - health check did not pass; recent logs:"
+journalctl -u todozee-price --no-pager -n 50 || true
+tail -n 50 /var/log/todozee-price/app.log 2>/dev/null || true
+exit 1
+DEPLOY
+chmod 0755 /usr/local/bin/deploy-app.sh
+
+# ─── systemd unit ────────────────────────────────────────────────────────────
+cat > /etc/systemd/system/todozee-price.service <<'UNIT'
+[Unit]
+Description=Todozee Price Fetcher (Gold & Silver rate API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=todozee
+WorkingDirectory=/opt/todozee-price
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/todozee-price/venv/bin/python /opt/todozee-price/safe_price_fetcher.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/todozee-price/app.log
+StandardError=append:/var/log/todozee-price/app.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now todozee-price
+
+# ─── Caddy (reverse proxy + automatic HTTPS) ─────────────────────────────────
+if ! command -v caddy >/dev/null 2>&1; then
+  curl -fsSL -o /usr/bin/caddy "https://caddyserver.com/api/download?os=linux&arch=amd64"
+  chmod +x /usr/bin/caddy
+fi
+id caddy >/dev/null 2>&1 || useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy
+mkdir -p /etc/caddy /var/lib/caddy
+chown -R caddy:caddy /var/lib/caddy
+
+cat > /etc/caddy/Caddyfile <<CADDY
+${domain} {
+    reverse_proxy 127.0.0.1:${app_port}
+    encode gzip
+    log {
+        output file /var/log/todozee-price/caddy-access.log
+    }
+}
+CADDY
+chown -R caddy:caddy /etc/caddy
+
+cat > /etc/systemd/system/caddy.service <<'CADDYUNIT'
+[Unit]
+Description=Caddy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+CADDYUNIT
+
+touch /var/log/todozee-price/caddy-access.log
+chown caddy:caddy /var/log/todozee-price/caddy-access.log
+systemctl daemon-reload
+systemctl enable --now caddy
+
+# ─── CloudWatch agent (logs + host metrics) ──────────────────────────────────
+cat > /opt/aws/amazon-cloudwatch-agent/etc/cw-config.json <<'CWAGENT'
+{
+  "agent": { "metrics_collection_interval": 60, "region": "${region}" },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/todozee-price/app.log",
+            "log_group_name": "${log_group_app}",
+            "log_stream_name": "{instance_id}/app",
+            "retention_in_days": 30
+          },
+          {
+            "file_path": "/var/log/todozee-price/bootstrap.log",
+            "log_group_name": "${log_group_boot}",
+            "log_stream_name": "{instance_id}/bootstrap",
+            "retention_in_days": 30
+          }
+        ]
+      }
+    }
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": { "InstanceId": "$${aws:InstanceId}" },
+    "metrics_collected": {
+      "mem": { "measurement": ["mem_used_percent"] },
+      "disk": { "measurement": ["disk_used_percent"], "resources": ["/"] }
+    }
+  }
+}
+CWAGENT
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/cw-config.json
+
+echo "=== bootstrap done $(date -u) ==="
